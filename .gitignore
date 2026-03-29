@@ -215,6 +215,7 @@ __marimo__/
 
 # Generated outputs (reproducible from code.py; not source)
 cleaned_data.xlsx
+task5_panel_results.xlsx
 
 # AI instruction / prompt / context files (local workflow, not source)
 CLAUDE.md
