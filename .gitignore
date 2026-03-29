@@ -205,3 +205,24 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# -----------------------------------------------------------------------
+# Project-specific additions
+# -----------------------------------------------------------------------
+
+# Proprietary financial data (WRDS/CRSP/Compustat licence prohibits redistribution)
+*.dta
+
+# Generated outputs (reproducible from code.py; not source)
+cleaned_data.xlsx
+task5_panel_results.xlsx
+
+# AI instruction / prompt / context files (local workflow, not source)
+CLAUDE.md
+Context.md
+
+# AI-generated write-up (academic integrity risk; not source)
+Interpretations.md
+
+# Assignment brief (third-party copyright)
+EF_Project_Instructions.pdf
