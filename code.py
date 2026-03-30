@@ -11,6 +11,10 @@ import sys
 import pandas as pd
 import statsmodels.api as sm
 from linearmodels.panel import PanelOLS, PooledOLS
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich import box
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -22,18 +26,21 @@ OUTPUT_FILE     = Path("task5_panel_results.xlsx")
 REQUIRED_COLS = ["permno", "year", "bm", "i2ppegt", "logme", "blev", "g_sale", "ret_a"]
 REGRESSORS    = ["logme", "bm", "g_sale", "blev"]
 
+console = Console(legacy_windows=False)
+
 
 # ---------------------------------------------------------------------------
 # Data loading and cleaning
 # ---------------------------------------------------------------------------
 
-def load_data(candidates: list[Path]) -> pd.DataFrame:
+def load_data(candidates: list[Path]) -> tuple[pd.DataFrame, Path]:
     """Try each candidate path in order; exit with a clear error if none exists."""
     for path in candidates:
         if path.exists():
-            return pd.read_stata(path)
+            return pd.read_stata(path), path
     tried = ", ".join(str(p) for p in candidates)
-    sys.exit(f"ERROR: data file not found. Tried: {tried}")
+    console.print(f"[bold red]ERROR[/]  data file not found. Tried: {tried}")
+    sys.exit(1)
 
 
 def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -61,7 +68,8 @@ def convert_year(df: pd.DataFrame) -> pd.DataFrame:
         df["year"] = pd.to_numeric(df["year"], errors="coerce")
         invalid = df["year"].isna().sum()
         if invalid > 0:
-            sys.exit(f"ERROR: {invalid} non-numeric values in 'year' after coercion.")
+            console.print(f"[bold red]ERROR[/]  {invalid} non-numeric values in 'year' after coercion.")
+            sys.exit(1)
         df["year"] = df["year"].astype(int)
     return df
 
@@ -73,10 +81,11 @@ def validate_panel(df: pd.DataFrame) -> None:
     """
     dup_keys = df.duplicated(subset=["permno", "year"]).sum()
     if dup_keys > 0:
-        sys.exit(
-            f"ERROR: {dup_keys} duplicate (permno, year) rows found. "
+        console.print(
+            f"[bold red]ERROR[/]  {dup_keys} duplicate (permno, year) rows found. "
             "Resolve before constructing lead returns."
         )
+        sys.exit(1)
 
 
 def make_lead_return(df: pd.DataFrame) -> pd.DataFrame:
@@ -94,45 +103,55 @@ def make_lead_return(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def run_verification(df: pd.DataFrame, n_before: int, n_after: int) -> None:
-    """Run required verification tests and print a PASS/FAIL summary."""
-    print("=" * 60)
-    print("VERIFICATION TESTS")
-    print("=" * 60)
-
+    """Run required verification tests and display results as Rich tables."""
     results: list[bool] = []
 
-    # Row count
+    def _status(ok: bool, warn_if_false: bool = False) -> str:
+        if not ok and warn_if_false:
+            return "[bold yellow]WARN[/]"
+        return "[bold green]PASS[/]" if ok else "[bold red]FAIL[/]"
+
+    # --- Verification checks table ---
+    checks = Table(box=box.SIMPLE_HEAD, header_style="bold", expand=False, padding=(0, 1))
+    checks.add_column("Check",  style="dim", min_width=16)
+    checks.add_column("Detail",              min_width=50)
+    checks.add_column("Status", justify="center", min_width=6)
+
+    # Row count (WARN if rows dropped — exact-duplicate removal is expected)
     rows_ok = n_after == n_before
     results.append(rows_ok)
-    print(
-        f"[Row count]        Before: {n_before:,}  After: {n_after:,}  "
-        f"(dropped: {n_before - n_after})  -> {'PASS' if rows_ok else 'WARN'}"
+    checks.add_row(
+        "Row count",
+        f"Before: {n_before:,}  ->  After: {n_after:,}  (dropped: {n_before - n_after:,})",
+        _status(rows_ok, warn_if_false=True),
     )
 
-    # Exact duplicates
+    # Exact duplicates post-clean
     dup_count = df.duplicated().sum()
     results.append(dup_count == 0)
-    print(f"[Duplicates]       Post-cleaning: {dup_count}  -> {'PASS' if dup_count == 0 else 'FAIL'}")
+    checks.add_row("Duplicates", f"Post-cleaning: {dup_count:,}", _status(dup_count == 0))
 
     # Panel key uniqueness
     dup_keys = df.duplicated(subset=["permno", "year"]).sum()
     results.append(dup_keys == 0)
-    print(f"[Panel keys]       Duplicate (permno, year): {dup_keys}  -> {'PASS' if dup_keys == 0 else 'FAIL'}")
+    checks.add_row("Panel keys", f"Duplicate (permno, year): {dup_keys:,}", _status(dup_keys == 0))
 
-    # Required columns
+    # Required columns present
     missing_cols = [c for c in REQUIRED_COLS if c not in df.columns]
     results.append(not missing_cols)
-    print(
-        f"[Required cols]    Missing: {missing_cols if missing_cols else 'none'}  "
-        f"-> {'FAIL' if missing_cols else 'PASS'}"
+    checks.add_row(
+        "Required cols",
+        "All present" if not missing_cols else f"Missing: {missing_cols}",
+        _status(not missing_cols),
     )
 
-    # Dtype checks
+    # Dtype checks (permno and year must be integer)
     type_ok = ("int" in str(df["permno"].dtype)) and ("int" in str(df["year"].dtype))
     results.append(type_ok)
-    print(
-        f"[Dtypes]           permno={df['permno'].dtype}  year={df['year'].dtype}  "
-        f"-> {'PASS' if type_ok else 'FAIL'}"
+    checks.add_row(
+        "Dtypes",
+        f"permno={df['permno'].dtype}  year={df['year'].dtype}",
+        _status(type_ok),
     )
 
     # All regression variables must be numeric
@@ -141,40 +160,73 @@ def run_verification(df: pd.DataFrame, n_before: int, n_after: int) -> None:
         if not pd.api.types.is_numeric_dtype(df[c])
     ]
     results.append(not non_numeric)
-    print(
-        f"[Numeric vars]     Non-numeric regression cols: "
-        f"{non_numeric if non_numeric else 'none'}  -> {'FAIL' if non_numeric else 'PASS'}"
+    checks.add_row(
+        "Numeric vars",
+        "All numeric" if not non_numeric else f"Non-numeric: {non_numeric}",
+        _status(not non_numeric),
     )
 
-    # Missing-value summary (flagged only — not dropped or imputed)
-    check_cols = REQUIRED_COLS + ["ret_a_lead"]
-    mv = df[check_cols].isnull().sum()
-    print("[Missing values]   (flagged — not imputed or dropped):")
-    for col, cnt in mv.items():
-        note = " **" if cnt > 0 else ""
-        print(f"  {col:15s}: {cnt:,}{note}")
-
-    # Lead-return: last obs per firm must be NaN
+    # Lead-return: last observation per firm must be NaN
     last_obs_nan = df.groupby("permno")["ret_a_lead"].apply(lambda s: s.iloc[-1]).isna().all()
     results.append(last_obs_nan)
-    print(f"[ret_a_lead]       Last obs per firm is NaN: {'PASS' if last_obs_nan else 'FAIL'}")
+    checks.add_row("ret_a_lead", "Last obs per firm is NaN", _status(last_obs_nan))
 
-    # Invalid value flags (flagged only)
-    print("[Invalid flags]    (flagged — not removed):")
-    print(f"  i2ppegt < 0 : {(df['i2ppegt'] < 0).sum():,}")
-    print(f"  |bm| > 10   : {(df['bm'].abs() > 10).sum():,}")
-    print(f"  i2ppegt > 10: {(df['i2ppegt'] > 10).sum():,}")
+    console.print(checks)
 
-    # Coverage summary
-    print(
-        f"[Coverage]         Year range: {df['year'].min()}–{df['year'].max()}  |  "
-        f"Firms: {df['permno'].nunique():,}  |  Obs: {len(df):,}"
+    # --- Missing values table (flagged only — not dropped or imputed) ---
+    check_cols = REQUIRED_COLS + ["ret_a_lead"]
+    mv = df[check_cols].isnull().sum()
+    n_total = len(df)
+
+    mv_table = Table(
+        title="Missing Values",
+        caption="flagged only - not imputed or dropped",
+        box=box.SIMPLE_HEAD, header_style="bold", expand=False, padding=(0, 1),
+    )
+    mv_table.add_column("Column",  style="dim", min_width=16)
+    mv_table.add_column("Missing", justify="right", min_width=9)
+    mv_table.add_column("% of N",  justify="right", min_width=7)
+    for col, cnt in mv.items():
+        mv_table.add_row(
+            col,
+            f"{cnt:,}",
+            f"{cnt / n_total * 100:.1f}%",
+            style="yellow" if cnt > 0 else "",
+        )
+    console.print(mv_table)
+
+    # --- Invalid value flags (flagged only — not removed) ---
+    flags_data = [
+        ("i2ppegt < 0",  int((df["i2ppegt"] < 0).sum())),
+        ("|bm| > 10",    int((df["bm"].abs() > 10).sum())),
+        ("i2ppegt > 10", int((df["i2ppegt"] > 10).sum())),
+    ]
+
+    flags_table = Table(
+        title="Invalid Value Flags",
+        caption="flagged only - not removed",
+        box=box.SIMPLE_HEAD, header_style="bold", expand=False, padding=(0, 1),
+    )
+    flags_table.add_column("Flag",  style="dim", min_width=16)
+    flags_table.add_column("Count", justify="right", min_width=9)
+    for flag, cnt in flags_data:
+        flags_table.add_row(flag, f"{cnt:,}", style="yellow" if cnt > 0 else "")
+    console.print(flags_table)
+
+    # --- Coverage summary ---
+    console.print(
+        f"\n  [dim]Coverage[/]   "
+        f"{df['year'].min()}-{df['year'].max()}  [dim]|[/]  "
+        f"Firms: {df['permno'].nunique():,}  [dim]|[/]  "
+        f"Obs: {len(df):,}\n"
     )
 
+    # --- Overall result ---
     overall = all(results)
-    print(f"\n{'=' * 60}")
-    print(f"OVERALL: {'PASS' if overall else 'FAIL (see above)'}")
-    print("=" * 60)
+    if overall:
+        console.print(Panel("[bold green]  OVERALL: PASS  [/]", expand=False, border_style="green", padding=(0, 2)))
+    else:
+        console.print(Panel("[bold red]  OVERALL: FAIL — review checks above  [/]", expand=False, border_style="red", padding=(0, 2)))
 
 
 # ---------------------------------------------------------------------------
@@ -246,16 +298,18 @@ def run_regression_family(
 ) -> tuple[pd.DataFrame, int, int]:
     """
     Run the six required specifications for dep_var against REGRESSORS.
-    Prints sample size and rows dropped for missing values.
     Returns (result table, N used, N dropped).
     """
-    sample   = panel[[dep_var] + REGRESSORS].dropna()
-    y        = sample[dep_var]
-    X        = sample[REGRESSORS]
-    n_used   = len(sample)
+    sample    = panel[[dep_var] + REGRESSORS].dropna()
+    y         = sample[dep_var]
+    X         = sample[REGRESSORS]
+    n_used    = len(sample)
     n_dropped = len(panel) - n_used
 
-    print(f"  {dep_var}: {n_used:,} obs used  ({n_dropped:,} dropped for missing values)")
+    console.print(
+        f"  [dim]>[/] [bold]{dep_var}[/]"
+        f"  [dim]{n_used:,} obs  ({n_dropped:,} dropped for missing values)[/]"
+    )
 
     # Spec 1: Pooled OLS, conventional SEs
     res_1 = PooledOLS(y, sm.add_constant(X)).fit(cov_type="unadjusted")
@@ -320,61 +374,83 @@ def export_results(
 # Main execution
 # ---------------------------------------------------------------------------
 
-# 1. Load raw data (tries CCM_sample.dta then CCM sample.dta)
-raw = load_data(DATA_CANDIDATES)
+# Stage 1: Load raw data (tries CCM_sample.dta then CCM sample.dta)
+console.rule("[bold gold1] DATA LOADING [/]")
+raw, data_path = load_data(DATA_CANDIDATES)
+console.print(f"  [dim]source[/]   {data_path}  ({raw.shape[0]:,} rows x {raw.shape[1]} cols)")
 
-# 2. Standardize column names to lowercase with underscores
+# Stage 2: Clean and prepare the panel
+console.rule("[bold gold1] DATA CLEANING [/]")
+
+# Standardize column names to lowercase with underscores
 raw = standardize_columns(raw)
 
-# 3. Convert year to integer (handles both datetime and numeric imports)
+# Convert year to integer (handles both datetime and numeric imports)
 raw = convert_year(raw)
 
-# 4. Cast permno to int (Stata stores it as float64 with no fractional part)
+# Cast permno to int (Stata stores it as float64 with no fractional part)
 raw["permno"] = raw["permno"].astype(int)
 
-# 5. Trim whitespace in any string columns
+# Trim whitespace in any string columns
 str_cols = raw.select_dtypes(include="object").columns
 raw[str_cols] = raw[str_cols].apply(lambda s: s.str.strip())
 
-# 6. Drop exact duplicate rows before panel validation
+# Drop exact duplicate rows before panel validation
 n_before = len(raw)
 raw = raw.drop_duplicates()
 n_after  = len(raw)
 
-# 7. Validate panel keys — must be unique before constructing lead return
+# Validate panel keys — must be unique before constructing lead return
 validate_panel(raw)
 
-# 8. Construct one-period-ahead return within each firm
+# Construct one-period-ahead return within each firm
 raw = make_lead_return(raw)
 
-# 9. Run verification tests
-run_verification(raw, n_before, n_after)
+console.print(
+    f"  Columns standardized  |  Year converted  |  permno cast to int  |  "
+    f"Exact duplicates dropped: {n_before - n_after:,}  |  Lead return constructed"
+)
 
-# ---------------------------------------------------------------------------
-# Regressions
-# ---------------------------------------------------------------------------
-print("\nRunning regressions...")
+# Stage 3: Run verification tests
+console.rule("[bold gold1] VERIFICATION [/]")
+console.print()
+run_verification(raw, n_before, n_after)
+console.print()
+
+# Stage 4: Run regressions
+console.rule("[bold gold1] REGRESSIONS [/]")
+console.print()
 panel = raw.set_index(["permno", "year"])
 
 inv_table, inv_n, inv_dropped = run_regression_family(panel, "i2ppegt")
 ret_table, ret_n, ret_dropped = run_regression_family(panel, "ret_a_lead")
 
-# ---------------------------------------------------------------------------
-# Export
-# ---------------------------------------------------------------------------
-data_file_used = next((str(p) for p in DATA_CANDIDATES if p.exists()), "unknown")
+# Sample size summary table
+sample_tbl = Table(box=box.SIMPLE_HEAD, header_style="bold", expand=False, padding=(0, 1))
+sample_tbl.add_column("Dependent Variable", style="dim", min_width=30)
+sample_tbl.add_column("N Used",             justify="right", min_width=9)
+sample_tbl.add_column("Dropped (missing)",  justify="right", min_width=18)
+sample_tbl.add_row("I2ppegt (investment rate)",     f"{inv_n:,}", f"{inv_dropped:,}")
+sample_tbl.add_row("ret_A_lead (next-year return)", f"{ret_n:,}", f"{ret_dropped:,}")
+console.print()
+console.print(sample_tbl)
+console.print()
+
+# Stage 5: Export results to Excel
+console.rule("[bold gold1] EXPORT [/]")
 meta = {
-    "Dataset":                          data_file_used,
-    "Total rows after cleaning":        f"{n_after:,}",
-    "Exact duplicates dropped":         f"{n_before - n_after:,}",
-    "Year range":                       f"{raw['year'].min()}–{raw['year'].max()}",
-    "Unique firms":                     f"{raw['permno'].nunique():,}",
-    "Investment sample (N)":            f"{inv_n:,}",
-    "Investment rows dropped (missing)":f"{inv_dropped:,}",
-    "Returns sample (N)":               f"{ret_n:,}",
-    "Returns rows dropped (missing)":   f"{ret_dropped:,}",
+    "Dataset":                           str(data_path),
+    "Total rows after cleaning":         f"{n_after:,}",
+    "Exact duplicates dropped":          f"{n_before - n_after:,}",
+    "Year range":                        f"{raw['year'].min()}–{raw['year'].max()}",
+    "Unique firms":                      f"{raw['permno'].nunique():,}",
+    "Investment sample (N)":             f"{inv_n:,}",
+    "Investment rows dropped (missing)": f"{inv_dropped:,}",
+    "Returns sample (N)":                f"{ret_n:,}",
+    "Returns rows dropped (missing)":    f"{ret_dropped:,}",
 }
 
 export_results(raw, inv_table, ret_table, meta, OUTPUT_FILE)
-print(f"\nExported to '{OUTPUT_FILE}'")
-print("  Sheets: Cleaned_Data, Investment_Regressions, Returns_Regressions, Metadata")
+console.print(f"  [dim]output[/]   {OUTPUT_FILE}")
+console.print(f"  [dim]sheets[/]   Cleaned_Data  |  Investment_Regressions  |  Returns_Regressions  |  Metadata")
+console.print()
