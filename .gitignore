@@ -226,3 +226,6 @@ Interpretations.md
 
 # Assignment brief (third-party copyright)
 EF_Project_Instructions.pdf
+
+# Stata files (referenced for building python code) 
+*.do
