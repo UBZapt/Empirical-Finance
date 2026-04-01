@@ -9,6 +9,7 @@ Regression engine: pyfixest feols(), replicating Stata's reghdfe.
 
 from pathlib import Path
 import sys
+import warnings
 
 # pyfixest's dependency chain (feols → IPython → pdb) does 'import code'.
 # Because this script is named code.py and Python adds its directory to
@@ -19,6 +20,7 @@ import sys
 if sys.path and sys.path[0] not in ("",):
     sys.path.pop(0)
 
+import numpy as np
 import pandas as pd
 from pyfixest.estimation import feols
 from rich.console import Console
@@ -28,8 +30,8 @@ from rich import box
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DATA_CANDIDATES = [Path("CCM_sample.dta"), Path("CCM sample.dta")]
-OUTPUT_FILE     = Path("task5_panel_results.xlsx")
+DATA_CANDIDATES     = [Path("CCM_sample.dta"), Path("CCM sample.dta")]
+OUTPUT_FILE         = Path("task5_panel_results.xlsx")
 
 REQUIRED_COLS = ["permno", "year", "bm", "i2ppegt", "logme", "blev", "g_sale", "ret_a"]
 REGRESSORS    = ["logme", "bm", "g_sale", "blev"]
@@ -39,13 +41,21 @@ REG_LABELS    = {"logme": "logME", "bm": "bm", "g_sale": "g_sale", "blev": "blev
 # formula_fe: the absorb/FE part appended to the base formula (empty = pooled OLS).
 # vcov: pyfixest variance estimator — "iid" for conventional, CRV1 dict for clustered.
 SPEC_META: list[dict] = [
-    {"formula_fe": "",                 "vcov": "iid",                             "firm_fe": False, "year_fe": False, "cluster": "None",      "r2_type": "overall"},
-    {"formula_fe": "| permno",         "vcov": "iid",                             "firm_fe": True,  "year_fe": False, "cluster": "None",      "r2_type": "within"},
-    {"formula_fe": "| permno + year",  "vcov": "iid",                             "firm_fe": True,  "year_fe": True,  "cluster": "None",      "r2_type": "within"},
-    {"formula_fe": "| permno + year",  "vcov": {"CRV1": "permno"},                "firm_fe": True,  "year_fe": True,  "cluster": "Firm",      "r2_type": "within"},
-    {"formula_fe": "| permno + year",  "vcov": {"CRV1": "year"},                  "firm_fe": True,  "year_fe": True,  "cluster": "Year",      "r2_type": "within"},
-    {"formula_fe": "| permno + year",  "vcov": {"CRV1": "permno + year"},         "firm_fe": True,  "year_fe": True,  "cluster": "Firm+Year", "r2_type": "within"},
+    {"formula_fe": "",                 "vcov": "iid",                       "firm_fe": False, "year_fe": False, "cluster": "None",      "r2_type": "overall"},
+    {"formula_fe": "| permno",         "vcov": "iid",                       "firm_fe": True,  "year_fe": False, "cluster": "None",      "r2_type": "within"},
+    {"formula_fe": "| permno + year",  "vcov": "iid",                       "firm_fe": True,  "year_fe": True,  "cluster": "None",      "r2_type": "within"},
+    {"formula_fe": "| permno + year",  "vcov": {"CRV1": "permno"},          "firm_fe": True,  "year_fe": True,  "cluster": "Firm",      "r2_type": "within"},
+    {"formula_fe": "| permno + year",  "vcov": {"CRV1": "year"},            "firm_fe": True,  "year_fe": True,  "cluster": "Year",      "r2_type": "within"},
+    {"formula_fe": "| permno + year",  "vcov": {"CRV1": "permno + year"},   "firm_fe": True,  "year_fe": True,  "cluster": "Firm+Year", "r2_type": "within"},
 ]
+
+# Suppress pyfixest's singleton-FE UserWarning — these are expected in unbalanced
+# panels and do not affect coefficient estimates or standard errors.
+warnings.filterwarnings(
+    "ignore",
+    message=".*singleton fixed effect.*",  # matches "effect(s)" in pyfixest 0.50
+    category=UserWarning,
+)
 
 console = Console(width=100, legacy_windows=False)
 
@@ -95,27 +105,61 @@ def convert_year(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def validate_and_coerce_permno(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Validate permno before coercion: check for missing values and non-integer-like
+    values (fractional parts), then convert to int. Exits with clear diagnostics
+    rather than letting astype() fail silently or with an opaque error.
+    """
+    df = df.copy()
+    n_missing = df["permno"].isna().sum()
+    if n_missing > 0:
+        console.print(f"[red]ERROR[/]  {n_missing} missing values in 'permno'.")
+        sys.exit(1)
+    numeric = pd.to_numeric(df["permno"], errors="coerce")
+    n_invalid = numeric.isna().sum()
+    if n_invalid > 0:
+        console.print(f"[red]ERROR[/]  {n_invalid} non-numeric values in 'permno'.")
+        sys.exit(1)
+    fractional = int((numeric != numeric.round()).sum())
+    if fractional > 0:
+        console.print(
+            f"[red]ERROR[/]  {fractional} non-integer values in 'permno' "
+            "(fractional parts detected)."
+        )
+        sys.exit(1)
+    df["permno"] = numeric.astype(int)
+    return df
+
+
 def validate_panel(df: pd.DataFrame) -> None:
     """
     Check that (permno, year) keys are unique before lead construction.
-    Duplicate panel keys would silently corrupt ret_a_lead.
+    Called after drop_duplicates() — any remaining duplicates here are non-identical
+    rows sharing the same panel key and cannot be resolved by deduplication.
     """
     dup_keys = df.duplicated(subset=["permno", "year"]).sum()
     if dup_keys > 0:
         console.print(
-            f"[red]ERROR[/]  {dup_keys} duplicate (permno, year) rows found. "
-            "Resolve before constructing lead returns."
+            f"[red]ERROR[/]  {dup_keys} duplicate (permno, year) rows remain after "
+            "deduplication. These are non-identical rows sharing the same panel key — "
+            "resolve before proceeding."
         )
         sys.exit(1)
 
 
 def make_lead_return(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add ret_a_lead: within-firm one-period-ahead return (shift(-1) within permno).
-    The final observation per firm is NaN by construction.
+    Add ret_a_lead: within-firm one-period-ahead return.
+    Only assigns a lead value where the next firm observation is exactly year t+1;
+    rows where a year gap is detected (next available year != t+1) are set to NaN
+    instead of carrying the next available return.
     """
-    df = df.sort_values(["permno", "year"]).reset_index(drop=True)
+    df        = df.sort_values(["permno", "year"]).reset_index(drop=True)
+    lead_year = df.groupby("permno")["year"].shift(-1)
     df["ret_a_lead"] = df.groupby("permno")["ret_a"].shift(-1)
+    gap_mask = lead_year.notna() & (lead_year != df["year"] + 1)
+    df.loc[gap_mask, "ret_a_lead"] = np.nan
     return df
 
 
@@ -123,8 +167,17 @@ def make_lead_return(df: pd.DataFrame) -> pd.DataFrame:
 # Verification
 # ---------------------------------------------------------------------------
 
-def run_verification(df: pd.DataFrame, n_before: int, n_after: int) -> bool:
-    """Run required verification tests; returns True if all checks pass."""
+def run_verification(
+    df: pd.DataFrame,
+    n_before: int,
+    n_after: int,
+    n_exact_dupes: int,
+) -> bool:
+    """
+    Run required verification tests; returns True if all checks pass.
+    n_exact_dupes is passed explicitly so the row-count check can distinguish
+    intentional deduplication from unexpected row loss.
+    """
     results: list[bool] = []
 
     def _status(ok: bool, warn_if_false: bool = False) -> str:
@@ -133,16 +186,18 @@ def run_verification(df: pd.DataFrame, n_before: int, n_after: int) -> bool:
         return "[green]PASS[/]" if ok else "[red]FAIL[/]"
 
     checks = Table(box=box.SIMPLE_HEAD, header_style="bold", expand=True, padding=(0, 1))
-    checks.add_column("Check",  min_width=16)
+    checks.add_column("Check",  min_width=18)
     checks.add_column("Detail")
     checks.add_column("Status", justify="center", min_width=6, no_wrap=True)
 
-    rows_ok = n_after == n_before
+    # PASS if the only row reduction matches the intentional deduplication step;
+    # any additional loss signals an unexpected cleaning action.
+    rows_ok = (n_before - n_after) == n_exact_dupes
     results.append(rows_ok)
     checks.add_row(
         "Row count",
-        f"Before: {n_before:,}  ->  After: {n_after:,}  (dropped: {n_before - n_after:,})",
-        _status(rows_ok, warn_if_false=True),
+        f"Before: {n_before:,}  ->  After: {n_after:,}  (deduped: {n_exact_dupes:,})",
+        _status(rows_ok),
     )
 
     dup_count = df.duplicated().sum()
@@ -180,9 +235,11 @@ def run_verification(df: pd.DataFrame, n_before: int, n_after: int) -> bool:
         _status(not non_numeric),
     )
 
-    last_obs_nan = df.groupby("permno")["ret_a_lead"].apply(lambda s: s.iloc[-1]).isna().all()
+    # Vectorized last-observation check using idxmax to avoid groupby-apply overhead.
+    last_idx     = df.groupby("permno")["year"].idxmax()
+    last_obs_nan = df.loc[last_idx, "ret_a_lead"].isna().all()
     results.append(last_obs_nan)
-    checks.add_row("ret_a_lead", "Last obs per firm is NaN", _status(last_obs_nan))
+    checks.add_row("ret_a_lead tail", "Last obs per firm is NaN", _status(last_obs_nan))
 
     console.print(checks)
 
@@ -202,25 +259,6 @@ def run_verification(df: pd.DataFrame, n_before: int, n_after: int) -> bool:
     for col, cnt in mv.items():
         mv_table.add_row(col, f"{cnt:,}", f"{cnt / n_total * 100:.1f}%")
     console.print(mv_table)
-    console.print()
-
-    # Potential invalid value flags (flagged only — not removed)
-    flags_data = [
-        ("i2ppegt < 0",  int((df["i2ppegt"] < 0).sum())),
-        ("|bm| > 10",    int((df["bm"].abs() > 10).sum())),
-        ("i2ppegt > 10", int((df["i2ppegt"] > 10).sum())),
-    ]
-
-    flags_table = Table(
-        title="[underline]Potential Invalid Value Flags[/underline]",
-        caption="flagged only - not removed",
-        box=box.SIMPLE_HEAD, header_style="bold", expand=True, padding=(0, 1),
-    )
-    flags_table.add_column("Flag",  min_width=16)
-    flags_table.add_column("Count", justify="right")
-    for flag, cnt in flags_data:
-        flags_table.add_row(flag, f"{cnt:,}")
-    console.print(flags_table)
 
     n_pass   = sum(results)
     n_checks = len(results)
@@ -263,23 +301,37 @@ def get_r2(fit: object, r2_type: str) -> float:
     return float(fit._r2)
 
 
-def build_reg_table(fits: list, specs: list[dict]) -> pd.DataFrame:
+def build_reg_table(
+    fits: list, specs: list[dict], sample: pd.DataFrame, dep_var: str
+) -> pd.DataFrame:
     """
     Build the multi-model summary DataFrame from a list of fitted pyfixest results.
-    Rows: coefficient + t-stat per regressor, R², FE flags, cluster level, N.
+    Rows: coefficient + t-stat per regressor, _cons for pooled OLS only (FE models
+    do not identify an intercept — those cells are left empty), R² variants,
+    FE flags, cluster level, N.
     Columns: specification labels (1)-(6).
+
+    Per-model coef/tstat/pval are cached once at the start to avoid redundant
+    method calls inside loops.
     """
     col_labels = [f"({i + 1})" for i in range(len(fits))]
+
+    # Cache per-model outputs once — avoids repeated attribute lookups in loops.
+    cached = [
+        {"coefs": fit.coef(), "tstats": fit.tstat(), "pvals": fit.pvalue()}
+        for fit in fits
+    ]
+
     rows: dict = {}
 
     for var in REGRESSORS:
-        label    = REG_LABELS[var]
-        coef_col: list[str] = []
+        label     = REG_LABELS[var]
+        coef_col: list[str]  = []
         tstat_col: list[str] = []
-        for fit in fits:
-            coefs  = fit.coef()
-            tstats = fit.tstat()
-            pvals  = fit.pvalue()
+        for c_data in cached:
+            coefs  = c_data["coefs"]
+            tstats = c_data["tstats"]
+            pvals  = c_data["pvals"]
             if var in coefs.index:
                 c = float(coefs[var])
                 t = float(tstats[var])
@@ -292,7 +344,37 @@ def build_reg_table(fits: list, specs: list[dict]) -> pd.DataFrame:
         rows[label]        = coef_col
         rows[f"({label})"] = tstat_col
 
-    rows["R\u00b2"]       = [f"{get_r2(fit, s['r2_type']):.3f}" for fit, s in zip(fits, specs)]
+    # _cons: directly estimated intercept for pooled OLS only.
+    # FE models do not identify the intercept — cells are left empty rather than
+    # reporting a delta-method implied constant, which is not a regression output.
+    cons_coef: list[str]  = []
+    cons_tstat: list[str] = []
+    for c_data in cached:
+        coefs  = c_data["coefs"]
+        tstats = c_data["tstats"]
+        pvals  = c_data["pvals"]
+        if "Intercept" in coefs.index:
+            c = float(coefs["Intercept"])
+            t = float(tstats["Intercept"])
+            p = float(pvals["Intercept"])
+            cons_coef.append(f"{c:.3f}{stars(p)}")
+            cons_tstat.append(f"({t:.3f})")
+        else:
+            cons_coef.append("")
+            cons_tstat.append("")
+    rows["_cons"]   = cons_coef
+    rows["(_cons)"] = cons_tstat
+
+    # R² (Within): within-R² for FE models; overall R² for pooled OLS.
+    rows["R\u00b2 (Within)"]  = [f"{get_r2(fit, s['r2_type']):.3f}" for fit, s in zip(fits, specs)]
+    # R² (Overall): unconditional R² for all specifications.
+    rows["R\u00b2 (Overall)"] = [f"{float(fit._r2):.3f}" for fit in fits]
+    # Adj. R²: pyfixest stores this as _adj_r2 (initialized to np.nan when absent).
+    rows["Adj. R\u00b2"] = [
+        f"{float(v):.3f}" if pd.notna(v := getattr(fit, "_adj_r2", np.nan)) else ""
+        for fit in fits
+    ]
+
     rows["Firm FE"]    = ["Yes" if s["firm_fe"] else "No" for s in specs]
     rows["Year FE"]    = ["Yes" if s["year_fe"] else "No" for s in specs]
     rows["Cluster SE"] = [s["cluster"]                    for s in specs]
@@ -318,12 +400,13 @@ def print_rich_family_table(table_df: pd.DataFrame, title: str) -> None:
     for col in table_df.columns:
         tbl.add_column(col, justify="right", min_width=10)
 
-    # Insert a section divider before R² to separate coefficients from model statistics
-    SECTION_BEFORE = {"\u00b2"}  # matches "R²"
+    # Insert a section divider before the R² block to separate coefficients from
+    # model fit statistics.
+    SECTION_BEFORE = {"R\u00b2 (Within)"}
     for idx_val, row in table_df.iterrows():
         label    = str(idx_val)
         is_tstat = label.startswith("(")
-        if label in SECTION_BEFORE or label == "R\u00b2":
+        if label in SECTION_BEFORE:
             tbl.add_section()
         tbl.add_row(label, *row.tolist(), style="dim" if is_tstat else "")
 
@@ -345,18 +428,17 @@ def run_regression_family(
     n_dropped   = len(data) - n_used
 
     fits  = [run_spec(dep_var, spec, sample) for spec in SPEC_META]
-    table = build_reg_table(fits, SPEC_META)
+    table = build_reg_table(fits, SPEC_META, sample, dep_var)
     return table, fits, n_used, n_dropped
 
 
 def export_results(
-    data: pd.DataFrame,
     inv_table: pd.DataFrame,
     ret_table: pd.DataFrame,
     meta: dict,
     output_path: Path,
 ) -> None:
-    """Export cleaned data, per-family tables, combined summary, and metadata to Excel."""
+    """Export per-family regression tables and metadata to Excel."""
     INV_CAPTION = (
         "Table 1: Investment Rate (I2ppegt) — "
         "(1) Pooled OLS  (2) Firm FE  (3)-(6) Firm+Year FE  |  "
@@ -369,38 +451,15 @@ def export_results(
         "* p<0.10  ** p<0.05  *** p<0.01  |  t-stats in parentheses  |  "
         "Within-R\u00b2 for FE models; overall R\u00b2 for Pooled OLS"
     )
-    COMBINED_CAPTION = (
-        "Combined Panel Regression Results — "
-        "* p<0.10  ** p<0.05  *** p<0.01  |  t-stats in parentheses  |  "
-        "Within-R\u00b2 for FE models; overall R\u00b2 for Pooled OLS"
-    )
-
-    # Combined summary: both families stacked with a blank separator row
-    gap = pd.DataFrame(
-        [[""] * len(inv_table.columns)],
-        columns=inv_table.columns,
-        index=[""],
-    )
-    combined = pd.concat([inv_table, gap, ret_table])
 
     meta_df = pd.DataFrame(list(meta.items()), columns=["Item", "Value"])
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        data.to_excel(writer, sheet_name="Cleaned_Data", index=False)
-
         inv_table.to_excel(writer, sheet_name="Investment_Regressions", startrow=2)
         writer.sheets["Investment_Regressions"].cell(row=1, column=1).value = INV_CAPTION
 
         ret_table.to_excel(writer, sheet_name="Returns_Regressions", startrow=2)
         writer.sheets["Returns_Regressions"].cell(row=1, column=1).value = RET_CAPTION
-
-        combined.to_excel(writer, sheet_name="Combined_Summary", startrow=4)
-        ws = writer.sheets["Combined_Summary"]
-        ws.cell(row=1, column=1).value = COMBINED_CAPTION
-        ws.cell(row=2, column=1).value = (
-            "Top panel: Investment Rate (I2ppegt).  "
-            "Bottom panel: Next-Year Return (ret_A_lead)."
-        )
 
         meta_df.to_excel(writer, sheet_name="Metadata", index=False)
 
@@ -419,30 +478,38 @@ console.rule("[bold gold1] DATA CLEANING [/]")
 
 raw = standardize_columns(raw)
 raw = convert_year(raw)
-
-permno_original_dtype = str(raw["permno"].dtype)
-raw["permno"] = raw["permno"].astype(int)
+raw = validate_and_coerce_permno(raw)
 
 str_cols   = raw.select_dtypes(include="object").columns
 n_str_cols = len(str_cols)
 raw[str_cols] = raw[str_cols].apply(lambda s: s.str.strip())
 
+# Surface duplicate panel keys before any row removal — this is a data-integrity
+# diagnostic. Duplicate (permno, year) keys before dedup are reported but not
+# immediately fatal; if they survive dedup they become fatal in validate_panel().
+n_dup_keys_before = int(raw.duplicated(subset=["permno", "year"]).sum())
+
 n_before = len(raw)
 raw      = raw.drop_duplicates()
 n_after  = len(raw)
+n_exact_dupes = n_before - n_after
 
+# After deduplication, any remaining duplicate panel keys are non-identical rows
+# sharing the same (permno, year) — these exit with an error.
 validate_panel(raw)
+
 raw = make_lead_return(raw)
 
 cleaning_tbl = Table(box=box.SIMPLE_HEAD, header_style="bold", expand=True, padding=(0, 1))
 cleaning_tbl.add_column("Step")
 cleaning_tbl.add_column("Result", justify="right")
-cleaning_tbl.add_row("Column names standardized",        "lowercase with underscores")
-cleaning_tbl.add_row("Year column converted",            "int64")
-cleaning_tbl.add_row("Firm ID (permno) coerced to int", f"{permno_original_dtype} -> int64")
-cleaning_tbl.add_row("String columns trimmed",           f"{n_str_cols} column(s)")
-cleaning_tbl.add_row("Exact duplicate rows removed",     f"{n_before - n_after:,} dropped")
-cleaning_tbl.add_row("Lead return constructed",          "ret_a_lead added (within-firm, t+1)")
+cleaning_tbl.add_row("Column names standardized",            "lowercase with underscores")
+cleaning_tbl.add_row("Year column converted",                "int64")
+cleaning_tbl.add_row("permno validated and coerced",         "int64")
+cleaning_tbl.add_row("String columns trimmed",               f"{n_str_cols} column(s)")
+cleaning_tbl.add_row("Duplicate (permno, year) before dedup", f"{n_dup_keys_before:,} found")
+cleaning_tbl.add_row("Exact duplicate rows removed",          f"{n_exact_dupes:,} dropped")
+cleaning_tbl.add_row("Lead return constructed",               "ret_a_lead added (true t+1, gap-safe)")
 console.print(cleaning_tbl)
 
 console.print(
@@ -453,7 +520,7 @@ console.print(
 
 # 3. Run verification tests
 console.rule("[bold gold1] VERIFICATION [/]")
-verification_passed = run_verification(raw, n_before, n_after)
+verification_passed = run_verification(raw, n_before, n_after, n_exact_dupes)
 
 # 4. Run regressions — pyfixest feols, 6 specifications x 2 dependent variables
 console.rule("[bold gold1] REGRESSIONS [/]")
@@ -475,11 +542,11 @@ console.print()
 # Print per-family regression result tables
 print_rich_family_table(
     inv_table,
-    "Table 1 \u2014 Investment Rate  |  Dep. Var: I2ppegt  |  Within-R\u00b2 for FE models",
+    "Table 1 \u2014 Investment Rate  |  Dep. Var: I2ppegt",
 )
 print_rich_family_table(
     ret_table,
-    "Table 2 \u2014 Next-Year Return  |  Dep. Var: ret_A_lead  |  Within-R\u00b2 for FE models",
+    "Table 2 \u2014 Next-Year Return  |  Dep. Var: ret_A_lead",
 )
 
 # 5. Export results to Excel
@@ -488,7 +555,7 @@ meta = {
     "Dataset":                           str(data_path),
     "Regression engine":                 "pyfixest feols (reghdfe equivalent)",
     "Total rows after cleaning":         f"{n_after:,}",
-    "Exact duplicates dropped":          f"{n_before - n_after:,}",
+    "Exact duplicates dropped":          f"{n_exact_dupes:,}",
     "Year range":                        f"{raw['year'].min()}-{raw['year'].max()}",
     "Unique firms":                      f"{raw['permno'].nunique():,}",
     "Investment sample (N)":             f"{inv_n:,}",
@@ -496,15 +563,13 @@ meta = {
     "Returns sample (N)":                f"{ret_n:,}",
     "Returns rows dropped (missing)":    f"{ret_dropped:,}",
 }
-export_results(raw, inv_table, ret_table, meta, OUTPUT_FILE)
+export_results(inv_table, ret_table, meta, OUTPUT_FILE)
 
 sheets_tbl = Table(box=box.SIMPLE_HEAD, header_style="bold", expand=True, padding=(0, 1))
 sheets_tbl.add_column("Sheet")
 sheets_tbl.add_column("Contents", justify="right")
-sheets_tbl.add_row("Cleaned_Data",           f"Panel data: {n_after:,} obs")
 sheets_tbl.add_row("Investment_Regressions", "Table 1 \u2014 I2ppegt, 6 specifications")
 sheets_tbl.add_row("Returns_Regressions",    "Table 2 \u2014 ret_A_lead, 6 specifications")
-sheets_tbl.add_row("Combined_Summary",       "Both families stacked, 6 specifications each")
 sheets_tbl.add_row("Metadata",               "Dataset info and sample sizes")
 console.print(f"  {OUTPUT_FILE}\n")
 console.print(sheets_tbl)

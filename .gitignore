@@ -229,3 +229,6 @@ EF_Project_Instructions.pdf
 
 # Stata files (referenced for building python code) 
 *.do
+
+#.claude settings file
+settings.local.json
