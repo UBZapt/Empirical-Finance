@@ -7,11 +7,10 @@ Empirical Finance groupwork, Task 5 - Panel Data Analysis
 
 ## Output
 
-Results are written to `task5_panel_results.xlsx` with five sheets:
+Results are written to `task5_panel_results.xlsx` with four sheets:
 - **Cleaned_Data** — the cleaned panel used for all regressions
 - **Investment_Regressions** — Table 1 (six specifications for I2ppegt)
 - **Returns_Regressions** — Table 2 (six specifications for ret_A_lead)
-- **Combined_Summary** — both regression families stacked in a single sheet
 - **Metadata** — dataset used, regression engine, row counts, and sample sizes
 
 Both regression tables are also printed to the terminal as Rich console tables.
@@ -32,9 +31,11 @@ Both regression tables are also printed to the terminal as Rich console tables.
 - `df.groupby("permno")["ret_a"].shift(-1)`: shifts `ret_a` up by one row *within each firm group*, so row `t` receives the return from year `t+1` of the same firm.
 - `feols("y ~ x | fe", data=df, vcov=...)`: pyfixest formula interface — the `|` separator introduces the high-dimensional fixed effects to absorb, replicating Stata's `reghdfe y x, absorb(fe)`.
 - `vcov={"CRV1": "permno + year"}`: Cameron–Gelbach–Miller two-way clustered sandwich estimator, equivalent to Stata's `cluster(permno year)` option in `reghdfe`; using a `+`-separated formula string activates multi-way clustering.
-- `fit._r2_within`: within-R², computed after absorbing fixed effects (on demeaned residuals); reported for all FE specifications in place of `fit._r2` (overall R²) used for pooled OLS.
+- `fit._r2_within`: within-R², computed after absorbing fixed effects (on demeaned residuals); reported in the `R² (Within)` row for FE models.
+- `fit._r2` / `fit._r2_adj`: overall R² and adjusted overall R², reported for all specifications in the `R² (Overall)` and `Adj. R²` rows respectively.
 - `get_r2(fit, r2_type)`: wrapper that selects `_r2_within` for FE models and `_r2` for pooled OLS, with a fallback if `_r2_within` is `None`.
 - `print_rich_family_table`: renders the summary DataFrame as a Rich console table with a section divider separating coefficients from model-level statistics.
+- `warnings.filterwarnings("ignore", message=".*singleton fixed effects.*")`: suppresses pyfixest's `UserWarning` about singleton groups dropped during FE absorption; these are expected in unbalanced panels and do not affect estimates.
 - `sys.path.pop(0)` guard at the top of the script: pyfixest's dependency chain (`feols → IPython → pdb`) does `import code`; because the script is named `code.py`, Python finds it before the stdlib module and crashes with a circular-import error. Removing the script directory from `sys.path` before pyfixest loads resolves this without side effects, since no local modules are imported.
 
 ## Regression notes

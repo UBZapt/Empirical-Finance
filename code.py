@@ -9,6 +9,7 @@ Regression engine: pyfixest feols(), replicating Stata's reghdfe.
 
 from pathlib import Path
 import sys
+import warnings
 
 # pyfixest's dependency chain (feols → IPython → pdb) does 'import code'.
 # Because this script is named code.py and Python adds its directory to
@@ -19,6 +20,7 @@ import sys
 if sys.path and sys.path[0] not in ("",):
     sys.path.pop(0)
 
+import numpy as np
 import pandas as pd
 from pyfixest.estimation import feols
 from rich.console import Console
@@ -46,6 +48,14 @@ SPEC_META: list[dict] = [
     {"formula_fe": "| permno + year",  "vcov": {"CRV1": "year"},                  "firm_fe": True,  "year_fe": True,  "cluster": "Year",      "r2_type": "within"},
     {"formula_fe": "| permno + year",  "vcov": {"CRV1": "permno + year"},         "firm_fe": True,  "year_fe": True,  "cluster": "Firm+Year", "r2_type": "within"},
 ]
+
+# Suppress pyfixest's singleton-FE UserWarning — these are expected in unbalanced
+# panels and do not affect coefficient estimates or standard errors.
+warnings.filterwarnings(
+    "ignore",
+    message=".*singleton fixed effect.*",  # matches "effect(s)" in pyfixest 0.50
+    category=UserWarning,
+)
 
 console = Console(width=100, legacy_windows=False)
 
@@ -263,18 +273,50 @@ def get_r2(fit: object, r2_type: str) -> float:
     return float(fit._r2)
 
 
-def build_reg_table(fits: list, specs: list[dict]) -> pd.DataFrame:
+def _implied_cons(
+    fit: object, sample: pd.DataFrame, dep_var: str
+) -> tuple[float, float]:
+    """
+    Compute the implied constant for an FE model via the delta method.
+    _cons = ȳ − Σ_k(x̄_k · β̂_k)
+    SE(_cons) = sqrt(x̄ᵀ · Cov(β̂) · x̄)
+    fit._vcov is a k×k numpy array ordered to match fit.coef().
+    Returns (coef, t_stat).
+    """
+    coefs    = fit.coef()                              # pandas Series, index = var names
+    all_vars = list(coefs.index)                       # order of columns in _vcov
+    reg_vars = [v for v in REGRESSORS if v in coefs.index]
+    idx      = [all_vars.index(v) for v in reg_vars]  # positions in _vcov
+
+    x_bar = np.array([sample[v].mean() for v in reg_vars])
+    beta  = np.array([float(coefs[v])  for v in reg_vars])
+    c     = float(sample[dep_var].mean()) - float(x_bar @ beta)
+
+    vcov_full = fit._vcov                              # k×k numpy array
+    vcov_sub  = vcov_full[np.ix_(idx, idx)]
+    var_c     = float(x_bar @ vcov_sub @ x_bar)
+    t         = c / np.sqrt(var_c) if var_c > 0 else np.nan
+    return c, t
+
+
+def build_reg_table(
+    fits: list, specs: list[dict], sample: pd.DataFrame, dep_var: str
+) -> pd.DataFrame:
     """
     Build the multi-model summary DataFrame from a list of fitted pyfixest results.
-    Rows: coefficient + t-stat per regressor, R², FE flags, cluster level, N.
+    Rows: coefficient + t-stat per regressor (including _cons), R² variants,
+          FE flags, cluster level, N.
+    _cons for pooled OLS is taken directly from the estimated intercept; for FE
+    models it is computed as the implied constant (ȳ − X̄β̂) with SE from the
+    delta method.
     Columns: specification labels (1)-(6).
     """
     col_labels = [f"({i + 1})" for i in range(len(fits))]
     rows: dict = {}
 
     for var in REGRESSORS:
-        label    = REG_LABELS[var]
-        coef_col: list[str] = []
+        label     = REG_LABELS[var]
+        coef_col: list[str]  = []
         tstat_col: list[str] = []
         for fit in fits:
             coefs  = fit.coef()
@@ -292,7 +334,36 @@ def build_reg_table(fits: list, specs: list[dict]) -> pd.DataFrame:
         rows[label]        = coef_col
         rows[f"({label})"] = tstat_col
 
-    rows["R\u00b2"]       = [f"{get_r2(fit, s['r2_type']):.3f}" for fit, s in zip(fits, specs)]
+    # _cons: directly estimated for pooled OLS; implied constant (delta method) for FE.
+    cons_coef: list[str]  = []
+    cons_tstat: list[str] = []
+    for fit, spec in zip(fits, specs):
+        coefs  = fit.coef()
+        tstats = fit.tstat()
+        pvals  = fit.pvalue()
+        if "Intercept" in coefs.index:
+            c = float(coefs["Intercept"])
+            t = float(tstats["Intercept"])
+            p = float(pvals["Intercept"])
+            cons_coef.append(f"{c:.3f}{stars(p)}")
+            cons_tstat.append(f"({t:.3f})")
+        else:
+            c, t = _implied_cons(fit, sample, dep_var)
+            cons_coef.append(f"{c:.3f}")
+            cons_tstat.append(f"({t:.3f})" if not np.isnan(t) else "")
+    rows["_cons"]   = cons_coef
+    rows["(_cons)"] = cons_tstat
+
+    # R² (Within): within-R² for FE models; overall R² for pooled OLS.
+    rows["R\u00b2 (Within)"]  = [f"{get_r2(fit, s['r2_type']):.3f}" for fit, s in zip(fits, specs)]
+    # R² (Overall): unconditional R² for all specifications.
+    rows["R\u00b2 (Overall)"] = [f"{float(fit._r2):.3f}" for fit in fits]
+    # Adj. R²: pyfixest stores this as _adj_r2 (initialized to np.nan when absent).
+    rows["Adj. R\u00b2"] = [
+        f"{float(v):.3f}" if pd.notna(v := getattr(fit, '_adj_r2', np.nan)) else ""
+        for fit in fits
+    ]
+
     rows["Firm FE"]    = ["Yes" if s["firm_fe"] else "No" for s in specs]
     rows["Year FE"]    = ["Yes" if s["year_fe"] else "No" for s in specs]
     rows["Cluster SE"] = [s["cluster"]                    for s in specs]
@@ -318,12 +389,13 @@ def print_rich_family_table(table_df: pd.DataFrame, title: str) -> None:
     for col in table_df.columns:
         tbl.add_column(col, justify="right", min_width=10)
 
-    # Insert a section divider before R² to separate coefficients from model statistics
-    SECTION_BEFORE = {"\u00b2"}  # matches "R²"
+    # Insert a section divider before the R² block to separate coefficients from
+    # model fit statistics.
+    SECTION_BEFORE = {"R\u00b2 (Within)"}
     for idx_val, row in table_df.iterrows():
         label    = str(idx_val)
         is_tstat = label.startswith("(")
-        if label in SECTION_BEFORE or label == "R\u00b2":
+        if label in SECTION_BEFORE:
             tbl.add_section()
         tbl.add_row(label, *row.tolist(), style="dim" if is_tstat else "")
 
@@ -345,7 +417,7 @@ def run_regression_family(
     n_dropped   = len(data) - n_used
 
     fits  = [run_spec(dep_var, spec, sample) for spec in SPEC_META]
-    table = build_reg_table(fits, SPEC_META)
+    table = build_reg_table(fits, SPEC_META, sample, dep_var)
     return table, fits, n_used, n_dropped
 
 
@@ -356,7 +428,7 @@ def export_results(
     meta: dict,
     output_path: Path,
 ) -> None:
-    """Export cleaned data, per-family tables, combined summary, and metadata to Excel."""
+    """Export cleaned data, per-family regression tables, and metadata to Excel."""
     INV_CAPTION = (
         "Table 1: Investment Rate (I2ppegt) — "
         "(1) Pooled OLS  (2) Firm FE  (3)-(6) Firm+Year FE  |  "
@@ -369,19 +441,6 @@ def export_results(
         "* p<0.10  ** p<0.05  *** p<0.01  |  t-stats in parentheses  |  "
         "Within-R\u00b2 for FE models; overall R\u00b2 for Pooled OLS"
     )
-    COMBINED_CAPTION = (
-        "Combined Panel Regression Results — "
-        "* p<0.10  ** p<0.05  *** p<0.01  |  t-stats in parentheses  |  "
-        "Within-R\u00b2 for FE models; overall R\u00b2 for Pooled OLS"
-    )
-
-    # Combined summary: both families stacked with a blank separator row
-    gap = pd.DataFrame(
-        [[""] * len(inv_table.columns)],
-        columns=inv_table.columns,
-        index=[""],
-    )
-    combined = pd.concat([inv_table, gap, ret_table])
 
     meta_df = pd.DataFrame(list(meta.items()), columns=["Item", "Value"])
 
@@ -393,14 +452,6 @@ def export_results(
 
         ret_table.to_excel(writer, sheet_name="Returns_Regressions", startrow=2)
         writer.sheets["Returns_Regressions"].cell(row=1, column=1).value = RET_CAPTION
-
-        combined.to_excel(writer, sheet_name="Combined_Summary", startrow=4)
-        ws = writer.sheets["Combined_Summary"]
-        ws.cell(row=1, column=1).value = COMBINED_CAPTION
-        ws.cell(row=2, column=1).value = (
-            "Top panel: Investment Rate (I2ppegt).  "
-            "Bottom panel: Next-Year Return (ret_A_lead)."
-        )
 
         meta_df.to_excel(writer, sheet_name="Metadata", index=False)
 
@@ -475,11 +526,11 @@ console.print()
 # Print per-family regression result tables
 print_rich_family_table(
     inv_table,
-    "Table 1 \u2014 Investment Rate  |  Dep. Var: I2ppegt  |  Within-R\u00b2 for FE models",
+    "Table 1 \u2014 Investment Rate  |  Dep. Var: I2ppegt",
 )
 print_rich_family_table(
     ret_table,
-    "Table 2 \u2014 Next-Year Return  |  Dep. Var: ret_A_lead  |  Within-R\u00b2 for FE models",
+    "Table 2 \u2014 Next-Year Return  |  Dep. Var: ret_A_lead",
 )
 
 # 5. Export results to Excel
@@ -504,7 +555,6 @@ sheets_tbl.add_column("Contents", justify="right")
 sheets_tbl.add_row("Cleaned_Data",           f"Panel data: {n_after:,} obs")
 sheets_tbl.add_row("Investment_Regressions", "Table 1 \u2014 I2ppegt, 6 specifications")
 sheets_tbl.add_row("Returns_Regressions",    "Table 2 \u2014 ret_A_lead, 6 specifications")
-sheets_tbl.add_row("Combined_Summary",       "Both families stacked, 6 specifications each")
 sheets_tbl.add_row("Metadata",               "Dataset info and sample sizes")
 console.print(f"  {OUTPUT_FILE}\n")
 console.print(sheets_tbl)
