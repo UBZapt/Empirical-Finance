@@ -4,7 +4,7 @@ Empirical Finance groupwork, Task 5 - Panel Data Analysis
 
 ## Dependencies
 
-Python 3.10+ is required. Install all third-party packages with:
+Python is required. Install all third-party packages with:
 
 Windows - run in command prompt | Mac - run in terminal:
 
