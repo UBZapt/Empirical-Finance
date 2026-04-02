@@ -527,8 +527,9 @@ console.rule("[bold gold1] REGRESSIONS [/]")
 console.print()
 console.print("  pyfixest feols \u2014 6 specifications \u00d7 2 dependent variables\n")
 
-inv_table, inv_fits, inv_n, inv_dropped = run_regression_family("i2ppegt",    raw)
-ret_table, ret_fits, ret_n, ret_dropped = run_regression_family("ret_a_lead", raw)
+with console.status("[bold gold1]Running regressions…[/]", spinner="dots"):
+    inv_table, inv_fits, inv_n, inv_dropped = run_regression_family("i2ppegt",    raw)
+    ret_table, ret_fits, ret_n, ret_dropped = run_regression_family("ret_a_lead", raw)
 
 reg_tbl = Table(box=box.SIMPLE_HEAD, header_style="bold", expand=True, padding=(0, 1))
 reg_tbl.add_column("Dependent Variable")
