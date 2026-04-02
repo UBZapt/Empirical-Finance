@@ -44,7 +44,7 @@ Both regression tables are also printed to the terminal.
 - **Year column**: If `year` imports as a datetime, the integer year is extracted via `.dt.year`; otherwise the column is stored directly to integer and validated for non-numeric values before proceeding.
 - **permno**: Cast from `float64` to `int32` (compact dtype reduces memory and speeds up FE factorization).
 - **gpa**: not listed as a regressor in the project brief.
-- **Missing values**: Flagged and reported but not dropped or imputed — downstream regression routines handle listwise deletion automatically.
+- **Missing values**: Flagged and reported but not dropped or imputed.
 - `ret_a_lead`: Constructed as the within-firm one-period-ahead `ret_a`. The lead return is set to `NaN` wherever the next available firm observation is not exactly `year + 1`, ensuring multi-year lookahead returns are never silently used as the next-year return. 
   - NOTE: The Stata code in week 9 assigns the next row's return regardless of year continuity and can produce multi-year lookaheads which doesn't fit the assignment instructions.
 
