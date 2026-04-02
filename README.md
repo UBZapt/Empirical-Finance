@@ -9,7 +9,7 @@ Python 3.10+ is required. Install all third-party packages with:
 Windows - run in command prompt | Mac - run in terminal:
 
 ```bash
-pip install numpy pandas pyfixest rich openpyxl
+pip install numpy pandas pyfixest openpyxl
 ```
 
 
@@ -18,7 +18,6 @@ pip install numpy pandas pyfixest rich openpyxl
 | `numpy`    | Numerical operations                                             |
 | `pandas`   | DataFrame handling and `.dta` file loading via `read_stata`      |
 | `pyfixest` | Panel regression engine (`feols`) — replicates Stata's `reghdfe` |
-| `rich`     | Formatted console output (tables, progress)                      |
 | `openpyxl` | Excel `.xlsx` export engine used by pandas                       |
 
 
@@ -43,7 +42,7 @@ Both regression tables are also printed to the terminal.
 ## Assumptions
 
 - **Year column**: If `year` imports as a datetime, the integer year is extracted via `.dt.year`; otherwise the column is stored directly to integer and validated for non-numeric values before proceeding.
-- **permno**: Cast from `float64` to `int64`.
+- **permno**: Cast from `float64` to `int32` (compact dtype reduces memory and speeds up FE factorization).
 - **gpa**: not listed as a regressor in the project brief.
 - **Missing values**: Flagged and reported but not dropped or imputed — downstream regression routines handle listwise deletion automatically.
 - `ret_a_lead`: Constructed as the within-firm one-period-ahead `ret_a`. The lead return is set to `NaN` wherever the next available firm observation is not exactly `year + 1`, ensuring multi-year lookahead returns are never silently used as the next-year return. 
@@ -52,20 +51,21 @@ Both regression tables are also printed to the terminal.
 ## Regression notes
 
 - Regression engine switched from `linearmodels` to `pyfixest` (`feols()`), which replicates Stata's `reghdfe` including its Frisch–Waugh–Lovell FE absorption and two-way clustering.
-- Specs (3)–(6) share the same absorbed FE structure (`| permno + year`); only the covariance estimator differs, so point estimates are identical across those four columns.
+- Specs (3)–(6) share the same absorbed FE structure (`| permno + year`); only the covariance estimator differs, so point estimates are identical across those four columns. The fit is estimated once and `.vcov()` is called in-place for each clustering variant, avoiding expensive model deepcopies.
 
 ## Non-obvious functions / methods
 
-- `validate_and_coerce_permno`: validates `permno` for missing values and fractional parts before `astype(int)`, so failures are caught with a count and a clear message rather than an opaque NumPy error.
+- `validate_and_coerce_permno`: coerces `permno` via `pd.to_numeric` then checks for NaN (covers both original missing and non-numeric) and fractional parts before `astype(int)`, so failures are caught with a clear message rather than an opaque NumPy error.
 - `validate_panel`: checks for duplicate `(permno, year)` keys *after* deduplication and exits with an error before lead-return construction; duplicate keys would silently corrupt `ret_a_lead`.
-- `make_lead_return`: computes a `lead_year` alongside the shifted return and sets `ret_a_lead = NaN` where `lead_year != year + 1`, preventing gap-spanning returns from being used as the next-year return.
+- `make_lead_return`: shifts both `year` and `ret_a` in a single groupby, sets `ret_a_lead = NaN` where the next year is not exactly `year + 1`, and returns precomputed diagnostics (`last_idx`, `gap_mask`, boundary/gap NaN counts) so downstream verification and reporting reuse them without repeating the groupby.
+- `_extract_fit_data(fit, r2_type)`: pulls coefficients, t-stats, p-values, R² variants, and N from a pyfixest fit into a plain dict. This allows `.vcov()` to be called in-place on one model object for specs 4–6 without needing `deepcopy`.
 - `pd.api.types.is_datetime64_any_dtype(df["year"])`: used to branch year conversion safely instead of blindly calling `.dt.year`, which raises `AttributeError` on non-datetime columns.
-- `df.groupby("permno")["ret_a"].shift(-1)`: shifts `ret_a` up by one row *within each firm group*, so row `t` receives the return from year `t+1` of the same firm.
+- `df.groupby("permno")[["year", "ret_a"]].shift(-1)`: shifts both columns up by one row *within each firm group* in a single groupby pass, so row `t` receives the year and return from the next firm observation.
 - `feols("y ~ x | fe", data=df, vcov=...)`: pyfixest formula interface — the `|` separator introduces the high-dimensional fixed effects to absorb, replicating Stata's `reghdfe y x, absorb(fe)`.
 - `vcov={"CRV1": "permno + year"}`: Cameron–Gelbach–Miller two-way clustered sandwich estimator, equivalent to Stata's `cluster(permno year)` option in `reghdfe`; using a `+`-separated formula string activates multi-way clustering.
-- `fit._r2_within`: within-R², computed after absorbing fixed effects (on demeaned residuals); reported in the `R² (Within)` row for FE models.
-- `fit._r2` / `fit._r2_adj`: overall R² and adjusted overall R², reported for all specifications in the `R² (Overall)` and `Adj. R²` rows respectively.
-- `get_r2(fit, r2_type)`: wrapper that selects `_r2_within` for FE models and `_r2` for pooled OLS, with a fallback if `_r2_within` is `None`.
-- `df.groupby("permno")["year"].idxmax()`: used in verification to find the last row per firm; retrieves the integer index of the maximum year within each group, which is faster than `apply(lambda s: s.iloc[-1])`.
+- `fit.vcov({"CRV1": "permno"})`: recomputes standard errors in-place on an already-estimated model, avoiding re-running the expensive FE absorption step.
+- `fit._r2_within`: within-R², computed after absorbing fixed effects (on demeaned residuals); reported in the `R2 (Within)` row for FE models.
+- `fit._r2` / `fit._adj_r2`: overall R² and adjusted overall R², reported for all specifications in the `R2 (Overall)` and `Adj. R2` rows respectively.
+- `df.groupby("permno")["year"].idxmax()`: used to find the last row per firm; retrieves the integer index of the maximum year within each group, which is faster than `apply(lambda s: s.iloc[-1])`.
 - `sys.path.pop(0)` guard at the top of the script: pyfixest's dependency chain (`feols → IPython → pdb`) does `import code`; because the script is named `code.py`, Python finds it before the stdlib module and crashes with a circular-import error. Removing the script directory from `sys.path` before pyfixest loads resolves this without side effects, since no local modules are imported.
 

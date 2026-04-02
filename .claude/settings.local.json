@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(py -3 code.py)"
+      "Bash(py -3 code.py)",
+      "Bash(py code.py)"
     ]
   }
 }
