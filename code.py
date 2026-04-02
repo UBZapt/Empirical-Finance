@@ -11,12 +11,7 @@ from pathlib import Path
 import sys
 import warnings
 
-# pyfixest's dependency chain (feols → IPython → pdb) does 'import code'.
-# Because this script is named code.py and Python adds its directory to
-# sys.path[0] at startup, the interpreter finds this file before the stdlib
-# module, causing a circular-import crash. Removing the script directory
-# before pyfixest loads prevents the collision. No local-module imports are
-# used, so this is safe.
+# Had an error with the file being named code.py, so sys.path[0] not in ("",) was added.
 if sys.path and sys.path[0] not in ("",):
     sys.path.pop(0)
 
@@ -46,8 +41,7 @@ SPEC_META: list[dict] = [
     {"firm_fe": True,  "year_fe": True,  "cluster": "Firm+Year", "r2_type": "within"},
 ]
 
-# Suppress pyfixest's singleton-FE UserWarning — these are expected in unbalanced
-# panels and do not affect coefficient estimates or standard errors.
+# Suppress pyfixest's singleton-FE UserWarning — these are expected in unbalanced panels and do not affect coefficient estimates or standard errors.
 warnings.filterwarnings(
     "ignore",
     message=".*singleton fixed effect.*",
@@ -62,7 +56,7 @@ SEP = "-" * 80
 # ---------------------------------------------------------------------------
 
 def load_data(candidates: list[Path]) -> tuple[pd.DataFrame, Path]:
-    """Try each candidate path in order; exit with a clear error if none exists."""
+    """Try each possible data file name; exit with a clear error if none exists."""
     for path in candidates:
         if path.exists():
             return pd.read_stata(path), path
@@ -85,7 +79,7 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
 def convert_year(df: pd.DataFrame) -> pd.DataFrame:
     """
     Extract integer year safely.
-    Uses .dt.year for datetime-typed columns (Stata stores annual dates as Jan 1);
+    Uses .dt.year for datetime-typed columns;
     otherwise coerces to numeric and validates before converting to int.
     """
     if pd.api.types.is_datetime64_any_dtype(df["year"]):
@@ -120,7 +114,7 @@ def validate_and_coerce_permno(df: pd.DataFrame) -> pd.DataFrame:
 
 def validate_panel(df: pd.DataFrame) -> None:
     """
-    Check that (permno, year) keys are unique before lead construction.
+    Check that (permno, year) keys are unique before ret a lead construction.
     Called after drop_duplicates() — any remaining duplicates here are non-identical
     rows sharing the same panel key and cannot be resolved by deduplication.
     """
@@ -139,7 +133,7 @@ def make_lead_return(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
     Only assigns a lead value where the next firm observation is exactly year t+1;
     rows where a year gap is detected are set to NaN.
 
-    Returns (df, last_idx, gap_mask, n_boundary_nan, n_gap_nan) so downstream
+    Returns (df, last_idx, gap_mask, n_boundary_nan, n_gap_nan) so later 
     code can reuse these without repeating the groupby.
     """
     df = df.sort_values(["permno", "year"]).reset_index(drop=True)
@@ -171,8 +165,6 @@ def run_verification(
 ) -> bool:
     """
     Run required verification tests; returns True if all checks pass.
-    last_idx and gap_mask are precomputed from make_lead_return to avoid
-    redundant groupby operations.
     """
     results: list[tuple[str, str, bool]] = []
 
@@ -367,15 +359,14 @@ def run_regression_family(
     dep_var: str, data: pd.DataFrame
 ) -> tuple[pd.DataFrame, int, int]:
     """
-    Run all six feols specifications for dep_var.
-    Returns (summary_df, n_used, n_dropped).
+    Run all six specifications for dep_var.
 
     Only 3 distinct coefficient models are estimated:
       - pooled OLS (spec 1)
       - firm FE    (spec 2)
       - firm+year FE (specs 3-6, different vcov only)
     Specs 4-6 reuse the firm+year FE fit by calling .vcov() in-place and
-    extracting results, avoiding expensive deepcopy of model objects.
+    extracting results.
     """
     cols_needed = [dep_var] + REGRESSORS + ["permno", "year"]
     sample      = data[cols_needed].dropna()
