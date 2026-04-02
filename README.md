@@ -1,6 +1,26 @@
 # Empirical-Finance
 Empirical Finance groupwork, Task 5 - Panel Data Analysis
 
+## Dependencies
+
+Python 3.10+ is required. Install all third-party packages with:
+
+```bash
+pip install numpy pandas pyfixest rich openpyxl
+```
+
+| Package | Purpose |
+|---------|---------|
+| `numpy` | Numerical operations |
+| `pandas` | DataFrame handling and `.dta` file loading via `read_stata` |
+| `pyfixest` | Panel regression engine (`feols`) — replicates Stata's `reghdfe` |
+| `rich` | Formatted console output (tables, progress) |
+| `openpyxl` | Excel `.xlsx` export engine used by pandas |
+
+`pandas.read_stata` requires no additional package for `.dta` files.
+
+---
+
 ## Data
 
 `CCM_sample.dta` is not included in this repository (WRDS/CRSP/Compustat licence prohibits redistribution). Download it from WRDS and place it in the project root before running `code.py`. The loader also accepts `CCM sample.dta` (with a space) — whichever exists is used; if neither is found, the script exits with a clear error.
