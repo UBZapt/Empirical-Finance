@@ -232,3 +232,6 @@ EF_Project_Instructions.pdf
 
 #.claude settings file
 settings.local.json
+
+#__pycache__/                                                                                                                                
+    *.pyc  
