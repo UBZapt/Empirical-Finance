@@ -241,6 +241,19 @@ def run_verification(
     results.append(last_obs_nan)
     checks.add_row("ret_a_lead tail", "Last obs per firm is NaN", _status(last_obs_nan))
 
+    # Confirm that year-gap rows are also NaN — validates the gap-safe lead logic.
+    # A gap row is one where the next within-firm observation exists but is not year+1.
+    lead_year_v = df.groupby("permno")["year"].shift(-1)
+    gap_mask_v  = lead_year_v.notna() & (lead_year_v != df["year"] + 1)
+    n_gaps      = int(gap_mask_v.sum())
+    gaps_are_nan = df.loc[gap_mask_v, "ret_a_lead"].isna().all() if n_gaps > 0 else True
+    results.append(gaps_are_nan)
+    checks.add_row(
+        "ret_a_lead gaps",
+        f"Gap rows: {n_gaps:,}  —  all NaN: {gaps_are_nan}",
+        _status(gaps_are_nan),
+    )
+
     console.print(checks)
 
     # Missing values (flagged only — not removed)
@@ -449,7 +462,9 @@ def export_results(
         "Table 2: Next-Year Return (ret_A_lead) — "
         "(1) Pooled OLS  (2) Firm FE  (3)-(6) Firm+Year FE  |  "
         "* p<0.10  ** p<0.05  *** p<0.01  |  t-stats in parentheses  |  "
-        "Within-R\u00b2 for FE models; overall R\u00b2 for Pooled OLS"
+        "Within-R\u00b2 for FE models; overall R\u00b2 for Pooled OLS  |  "
+        "N excludes boundary obs (last firm-year, no t+1) and gap obs "
+        "(year discontinuity — multi-year lookaheads suppressed)"
     )
 
     meta_df = pd.DataFrame(list(meta.items()), columns=["Item", "Value"])
@@ -500,16 +515,25 @@ validate_panel(raw)
 
 raw = make_lead_return(raw)
 
+# Decompose ret_a_lead NaNs into two distinct causes so the sample reduction is
+# transparent when reported: boundary NaNs (last obs per firm — no t+1 exists) vs.
+# gap NaNs (next obs exists but is not exactly year+1, so the lead would be a
+# multi-year lookahead and is suppressed).
+_last_idx        = raw.groupby("permno")["year"].idxmax()
+n_boundary_nan   = int(raw.loc[_last_idx, "ret_a_lead"].isna().sum())
+n_gap_nan        = int(raw["ret_a_lead"].isna().sum()) - n_boundary_nan
+
 cleaning_tbl = Table(box=box.SIMPLE_HEAD, header_style="bold", expand=True, padding=(0, 1))
 cleaning_tbl.add_column("Step")
 cleaning_tbl.add_column("Result", justify="right")
-cleaning_tbl.add_row("Column names standardized",            "lowercase with underscores")
-cleaning_tbl.add_row("Year column converted",                "int64")
-cleaning_tbl.add_row("permno validated and coerced",         "int64")
-cleaning_tbl.add_row("String columns trimmed",               f"{n_str_cols} column(s)")
+cleaning_tbl.add_row("Column names standardized",             "lowercase with underscores")
+cleaning_tbl.add_row("Year column converted",                 "int64")
+cleaning_tbl.add_row("permno validated and coerced",          "int64")
+cleaning_tbl.add_row("String columns trimmed",                f"{n_str_cols} column(s)")
 cleaning_tbl.add_row("Duplicate (permno, year) before dedup", f"{n_dup_keys_before:,} found")
 cleaning_tbl.add_row("Exact duplicate rows removed",          f"{n_exact_dupes:,} dropped")
-cleaning_tbl.add_row("Lead return constructed",               "ret_a_lead added (true t+1, gap-safe)")
+cleaning_tbl.add_row("ret_a_lead: boundary NaN (last obs/firm)",  f"{n_boundary_nan:,} rows")
+cleaning_tbl.add_row("ret_a_lead: gap NaN (year discontinuity)",  f"{n_gap_nan:,} rows")
 console.print(cleaning_tbl)
 
 console.print(
@@ -527,8 +551,9 @@ console.rule("[bold gold1] REGRESSIONS [/]")
 console.print()
 console.print("  pyfixest feols \u2014 6 specifications \u00d7 2 dependent variables\n")
 
-inv_table, inv_fits, inv_n, inv_dropped = run_regression_family("i2ppegt",    raw)
-ret_table, ret_fits, ret_n, ret_dropped = run_regression_family("ret_a_lead", raw)
+with console.status("[bold gold1]Running regressions…[/]", spinner="dots"):
+    inv_table, inv_fits, inv_n, inv_dropped = run_regression_family("i2ppegt",    raw)
+    ret_table, ret_fits, ret_n, ret_dropped = run_regression_family("ret_a_lead", raw)
 
 reg_tbl = Table(box=box.SIMPLE_HEAD, header_style="bold", expand=True, padding=(0, 1))
 reg_tbl.add_column("Dependent Variable")
@@ -558,10 +583,12 @@ meta = {
     "Exact duplicates dropped":          f"{n_exact_dupes:,}",
     "Year range":                        f"{raw['year'].min()}-{raw['year'].max()}",
     "Unique firms":                      f"{raw['permno'].nunique():,}",
-    "Investment sample (N)":             f"{inv_n:,}",
-    "Investment rows dropped (missing)": f"{inv_dropped:,}",
-    "Returns sample (N)":                f"{ret_n:,}",
-    "Returns rows dropped (missing)":    f"{ret_dropped:,}",
+    "Investment sample (N)":                        f"{inv_n:,}",
+    "Investment rows dropped (missing)":            f"{inv_dropped:,}",
+    "Returns sample (N)":                           f"{ret_n:,}",
+    "Returns rows dropped (missing)":               f"{ret_dropped:,}",
+    "ret_a_lead boundary NaN (last obs per firm)":  f"{n_boundary_nan:,}",
+    "ret_a_lead gap NaN (year discontinuity)":      f"{n_gap_nan:,}",
 }
 export_results(inv_table, ret_table, meta, OUTPUT_FILE)
 
