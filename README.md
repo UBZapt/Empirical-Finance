@@ -2,6 +2,8 @@
 
 Empirical Finance groupwork, Task 5 - Panel Data Analysis
 
+**Note:** The Regressions are a little slow, so give the code about 30 seconds in total to finish running
+
 ## Dependencies
 
 Python is required. Install all third-party packages with:
